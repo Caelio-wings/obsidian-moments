@@ -1,16 +1,16 @@
 {
   "compilerOptions": {
-    "target": "ES6",
-    "module": "ESNext",
-    "moduleResolution": "node",
+    "target": "ES2020",
+    "module": "CommonJS",        // 关键：输出 CommonJS
+    "moduleResolution": "node",  // 或者 "node10"
+    "esModuleInterop": true,     // 帮助处理默认导入
     "strict": true,
-    "baseUrl": ".",
     "allowJs": false,
     "noImplicitAny": true,
     "strictNullChecks": true,
     "isolatedModules": true,
     "importHelpers": true,
-    "lib": ["DOM", "ES6", "ES7"],
+    "lib": ["DOM", "ES2020"],
     "types": ["obsidian"],
     "skipLibCheck": true
   },

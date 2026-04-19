@@ -8,6 +8,7 @@ import {
 	TFile,
 	TFolder,
 	normalizePath,
+	MarkdownRenderer,
 } from "obsidian";
 
 export type MomentsOrder = "asc" | "desc";
@@ -26,6 +27,7 @@ interface MomentItem {
 	comments: string[];
 	body: string;
 	images: string[];
+	imagesMarkdown: string; // 新增：原始图片区 Markdown
 }
 
 export const DEFAULT_SETTINGS: MomentsSettings = {
@@ -35,7 +37,7 @@ export const DEFAULT_SETTINGS: MomentsSettings = {
 };
 
 export default class ObsidianMomentsPlugin extends Plugin {
-	settings: MomentsSettings;
+	settings!: MomentsSettings;
 
 	async onload() {
 		await this.loadSettings();
@@ -92,9 +94,9 @@ export default class ObsidianMomentsPlugin extends Plugin {
 			return this.settings.order === "asc" ? timeA - timeB : timeB - timeA;
 		});
 
-		for (const item of items) {
-			this.renderMomentCard(feedEl, item);
-		}
+		// 异步渲染每个卡片，等待所有完成
+		const renderPromises = items.map(item => this.renderMomentCardAsync(feedEl, item));
+		await Promise.all(renderPromises);
 	}
 
 	private getMomentMarkdownFiles(folderPath: string, currentSourcePath?: string): TFile[] {
@@ -121,10 +123,11 @@ export default class ObsidianMomentsPlugin extends Plugin {
 		const raw = await this.app.vault.read(file);
 		const markdownBody = this.stripYamlFrontmatter(raw).trim();
 		const body = this.extractContentSection(markdownBody);
+		const imagesMarkdown = this.extractImagesSection(markdownBody); // 新增
 		const images = this.extractImageLinks(markdownBody);
 		const comments = this.extractCommentsFromMarkdown(markdownBody);
 
-		return { file, title, location, createdAt, comments, body, images };
+		return { file, title, location, createdAt, comments, body, images, imagesMarkdown };
 	}
 
 	private stripYamlFrontmatter(content: string): string {
@@ -136,14 +139,44 @@ export default class ObsidianMomentsPlugin extends Plugin {
 		const scope = imageSection ?? content;
 		const result: string[] = [];
 		this.forEachNonCodeSegment(scope, (segment) => {
-			const regex = /!\[\[([^\]]+?)\]\]/g;
-			let match: RegExpExecArray | null = null;
-			while ((match = regex.exec(segment)) !== null) {
-				const raw = match[1].split("|")[0].trim();
+			// 提取 Obsidian 格式
+			const obsidianRegex = /!\[\[([^\]]+?)\]\]/g;
+			let obsidianMatch: RegExpExecArray | null = null;
+			while ((obsidianMatch = obsidianRegex.exec(segment)) !== null) {
+				const raw = obsidianMatch[1].split("|")[0].trim();
+				if (raw) result.push(raw);
+			}
+			// 提取 Markdown 格式
+			const markdownRegex = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+			let markdownMatch: RegExpExecArray | null = null;
+			while ((markdownMatch = markdownRegex.exec(segment)) !== null) {
+				const raw = markdownMatch[1].split("|")[0].trim();
 				if (raw) result.push(raw);
 			}
 		});
 		return result;
+	}
+
+	// 新增：提取图片节的原始 Markdown 文本
+	private extractImagesSection(content: string): string {
+		const normalized = content.replace(/\r\n/g, "\n");
+		const lines = normalized.split("\n");
+		let inImages = false;
+		let resultLines: string[] = [];
+		for (const line of lines) {
+			const headingMatch = line.match(/^##\s*(.+?)\s*$/);
+			if (headingMatch) {
+				if (inImages) break;
+				if (headingMatch[1].trim() === "图片") {
+					inImages = true;
+					continue;
+				}
+			}
+			if (inImages) {
+				resultLines.push(line);
+			}
+		}
+		return resultLines.join("\n").trim();
 	}
 
 	private extractContentSection(content: string): string {
@@ -223,84 +256,95 @@ export default class ObsidianMomentsPlugin extends Plugin {
 		flush();
 	}
 
-	private renderMomentCard(parentEl: HTMLElement, item: MomentItem) {
-		const cardEl = parentEl.createDiv({ cls: "moments-card" });
+	// 修改为异步方法，并使用 MarkdownRenderer 渲染图片
+		private async renderMomentCardAsync(parentEl: HTMLElement, item: MomentItem) {
+			const cardEl = parentEl.createDiv({ cls: "moments-card" });
 
-		const headerEl = cardEl.createDiv({ cls: "moments-card-header" });
-		headerEl.createDiv({ cls: "moments-title", text: item.title || "未命名" });
+			const headerEl = cardEl.createDiv({ cls: "moments-card-header" });
+			headerEl.createDiv({ cls: "moments-title", text: item.title || "未命名" });
 
-		const bodyEl = cardEl.createDiv({ cls: "moments-body" });
-		bodyEl.setText(this.removeImageLinksFromBody(item.body));
+			const bodyEl = cardEl.createDiv({ cls: "moments-body" });
+			bodyEl.setText(this.removeImageLinksFromBody(item.body));
 
-		if (item.images.length > 0) {
-			const imgCount = item.images.length;
-			const gridEl = cardEl.createDiv({ cls: "moments-grid" });
-			gridEl.addClass(`grid-${imgCount}`);
-			if (imgCount === 1) gridEl.addClass("moments-grid--1");
-			else if (imgCount <= 4) gridEl.addClass("moments-grid--2");
-			else gridEl.addClass("moments-grid--3");
-			this.applyGridLayoutStyle(gridEl, imgCount);
+			// 图片部分：使用 MarkdownRenderer 渲染，然后重新组织为网格布局
+			if (item.imagesMarkdown && item.imagesMarkdown.trim()) {
+				const tempDiv = document.createElement("div");
+				await MarkdownRenderer.render(
+					this.app,
+					item.imagesMarkdown,
+					tempDiv,
+					item.file.path,
+					this
+				);
+				// 提取所有图片元素
+				const images = Array.from(tempDiv.querySelectorAll("img"));
+				if (images.length > 0) {
+					const gridEl = cardEl.createDiv({ cls: "moments-grid" });
+					const imgCount = images.length;
+					gridEl.addClass(`grid-${imgCount}`);
+					if (imgCount === 1) gridEl.addClass("moments-grid--1");
+					else if (imgCount <= 4) gridEl.addClass("moments-grid--2");
+					else gridEl.addClass("moments-grid--3");
+					this.applyGridLayoutStyle(gridEl, imgCount);
 
-				for (const imageLink of item.images) {
-					const imgSrc = this.resolveImageResourcePath(imageLink, item.file);
-					if (!imgSrc) continue;
-					const imgEl = gridEl.createEl("img", { cls: "moments-image" });
-					imgEl.src = imgSrc;
-					imgEl.alt = imageLink;
-					imgEl.style.width = "100%";
-					imgEl.style.display = "block";
-					imgEl.style.objectFit = imgCount === 1 ? "contain" : "cover";
-					imgEl.style.aspectRatio = imgCount === 1 ? "auto" : "1 / 1";
-					imgEl.style.borderRadius = "4px";
+					for (const img of images) {
+						// 移除原有样式，让网格控制
+						img.style.width = "100%";
+						img.style.display = "block";
+						img.style.objectFit = imgCount === 1 ? "contain" : "cover";
+						img.style.aspectRatio = imgCount === 1 ? "auto" : "1 / 1";
+						img.style.borderRadius = "4px";
+						gridEl.appendChild(img);
+					}
 				}
 			}
 
-		const commentsSectionEl = cardEl.createDiv({ cls: "moments-comments-section" });
-		const commentsDetailsEl = commentsSectionEl.createEl("details", { cls: "moments-comments-details" });
-		const commentsSummaryEl = commentsDetailsEl.createEl("summary", { cls: "moments-comments-summary" });
-		commentsSummaryEl.setText(this.formatCommentsSummaryText(item.comments.length));
-		const commentsBubbleEl = commentsDetailsEl.createDiv({ cls: "moments-comments-bubble" });
-		const commentsInlineListEl = commentsBubbleEl.createDiv({ cls: "moments-comments-inline-list" });
-		this.renderCommentsList(commentsInlineListEl, item.comments);
-		const composerEl = commentsBubbleEl.createDiv({ cls: "moments-comment-composer is-hidden" });
-		const commentInput = composerEl.createEl("input", {
-			type: "text",
-			cls: "moments-comment-input",
-			placeholder: "写评论...",
-		});
-		const submitCommentBtn = composerEl.createEl("button", { text: "发送", cls: "moments-comment-submit" });
-		if (item.comments.length === 0) {
-			commentsSectionEl.addClass("is-hidden");
-		}
-
-		const metaRowEl = cardEl.createDiv({ cls: "moments-meta-row" });
-		const metaLeftEl = metaRowEl.createDiv({ cls: "moments-meta-left" });
-		metaLeftEl.createDiv({ cls: "moments-time", text: item.createdAt || "未知时间" });
-		const locationEl = metaLeftEl.createDiv({ cls: "moments-location" });
-		locationEl.createSpan({ cls: "moments-location-icon", text: "📍" });
-		locationEl.appendText(item.location || "未填写地点");
-		const actionsEl = metaRowEl.createDiv({ cls: "moments-actions" });
-		const detailBtn = actionsEl.createEl("button", { text: "详情" });
-		const commentBtn = actionsEl.createEl("button", { text: "评论" });
-
-		detailBtn.addEventListener("click", async () => {
-			await this.app.workspace.getLeaf(false).openFile(item.file);
-		});
-		commentBtn.addEventListener("click", () => {
-			commentsSectionEl.removeClass("is-hidden");
-			commentsDetailsEl.open = true;
-			composerEl.removeClass("is-hidden");
-			commentInput.focus();
-		});
-		submitCommentBtn.addEventListener("click", async () => {
-			const commentText = commentInput.value.trim();
-			if (!commentText) {
-				new Notice("评论内容不能为空");
-				return;
+			const commentsSectionEl = cardEl.createDiv({ cls: "moments-comments-section" });
+			const commentsDetailsEl = commentsSectionEl.createEl("details", { cls: "moments-comments-details" });
+			const commentsSummaryEl = commentsDetailsEl.createEl("summary", { cls: "moments-comments-summary" });
+			commentsSummaryEl.setText(this.formatCommentsSummaryText(item.comments.length));
+			const commentsBubbleEl = commentsDetailsEl.createDiv({ cls: "moments-comments-bubble" });
+			const commentsInlineListEl = commentsBubbleEl.createDiv({ cls: "moments-comments-inline-list" });
+			this.renderCommentsList(commentsInlineListEl, item.comments);
+			const composerEl = commentsBubbleEl.createDiv({ cls: "moments-comment-composer is-hidden" });
+			const commentInput = composerEl.createEl("input", {
+				type: "text",
+				cls: "moments-comment-input",
+				placeholder: "写评论...",
+			});
+			const submitCommentBtn = composerEl.createEl("button", { text: "发送", cls: "moments-comment-submit" });
+			if (item.comments.length === 0) {
+				commentsSectionEl.addClass("is-hidden");
 			}
-			const now = new Date();
-			const commentLine = `${this.formatCommentTime(now)} - ${commentText}`;
-			try {
+
+			const metaRowEl = cardEl.createDiv({ cls: "moments-meta-row" });
+			const metaLeftEl = metaRowEl.createDiv({ cls: "moments-meta-left" });
+			metaLeftEl.createDiv({ cls: "moments-time", text: item.createdAt || "未知时间" });
+			const locationEl = metaLeftEl.createDiv({ cls: "moments-location" });
+			locationEl.createSpan({ cls: "moments-location-icon", text: "📍" });
+			locationEl.appendText(item.location || "未填写地点");
+			const actionsEl = metaRowEl.createDiv({ cls: "moments-actions" });
+			const detailBtn = actionsEl.createEl("button", { text: "详情" });
+			const commentBtn = actionsEl.createEl("button", { text: "评论" });
+
+			detailBtn.addEventListener("click", async () => {
+				await this.app.workspace.getLeaf(false).openFile(item.file);
+			});
+			commentBtn.addEventListener("click", () => {
+				commentsSectionEl.removeClass("is-hidden");
+				commentsDetailsEl.open = true;
+				composerEl.removeClass("is-hidden");
+				commentInput.focus();
+			});
+			submitCommentBtn.addEventListener("click", async () => {
+				const commentText = commentInput.value.trim();
+				if (!commentText) {
+					new Notice("评论内容不能为空");
+					return;
+				}
+				const now = new Date();
+				const commentLine = `${this.formatCommentTime(now)} - ${commentText}`;
+				try {
 					await this.app.vault.process(item.file, (data) => {
 						const normalized = data.replace(/\r\n/g, "\n").trimEnd();
 						const commentItem = `- ${commentLine}`;
@@ -327,6 +371,32 @@ export default class ObsidianMomentsPlugin extends Plugin {
 					console.error(error);
 					new Notice("评论提交失败");
 				}
+			});
+		}
+
+	// 新增：对渲染后的图片应用网格样式
+	private applyGridToRenderedImages(container: HTMLElement, imgCount: number) {
+		const imgs = container.querySelectorAll("img");
+		if (imgs.length === 0) return;
+		container.classList.add("moments-images-render-grid");
+		container.style.display = "grid";
+		container.style.gap = "5px";
+		if (imgCount === 1) {
+			container.style.gridTemplateColumns = "1fr";
+			container.style.maxWidth = "220px";
+		} else if (imgCount <= 4) {
+			container.style.gridTemplateColumns = "repeat(2, minmax(0, 1fr))";
+			container.style.maxWidth = "220px";
+		} else {
+			container.style.gridTemplateColumns = "repeat(3, minmax(0, 1fr))";
+			container.style.maxWidth = "330px";
+		}
+		imgs.forEach(img => {
+			img.style.width = "100%";
+			img.style.display = "block";
+			img.style.objectFit = imgCount === 1 ? "contain" : "cover";
+			img.style.aspectRatio = imgCount === 1 ? "auto" : "1 / 1";
+			img.style.borderRadius = "4px";
 		});
 	}
 
@@ -361,17 +431,24 @@ export default class ObsidianMomentsPlugin extends Plugin {
 	private removeImageLinksFromBody(content: string): string {
 		const parts: string[] = [];
 		this.forEachNonCodeSegment(content, (segment) => {
-			parts.push(segment.replace(/!\[\[[^\]]+?\]\]/g, ""));
+			segment = segment.replace(/!\[\[[^\]]+?\]\]/g, "");
+			segment = segment.replace(/!\[[^\]]*\]\([^)]+\)/g, "");
+			parts.push(segment);
 		});
 		return parts.join("\n").trim();
 	}
 
 	resolveImageResourcePath(link: string, fromFile: TFile): string | null {
+		// 判断是否是网络URL（以 http://, https://, // 开头）
+		if (link.match(/^(https?:\/\/|\/\/)/)) {
+			return link;
+		}
+
+		// 处理本地文件
 		const target = this.app.metadataCache.getFirstLinkpathDest(link, fromFile.path);
 		if (!target) return null;
 		return this.app.vault.adapter.getResourcePath(target.path);
 	}
-
 	private applyGridLayoutStyle(gridEl: HTMLElement, imgCount: number) {
 		gridEl.style.display = "grid";
 		gridEl.style.gap = "5px";
@@ -386,6 +463,8 @@ export default class ObsidianMomentsPlugin extends Plugin {
 			gridEl.style.maxWidth = "330px";
 		}
 	}
+
+
 
 	private parseDateTime(value: string): number {
 		if (!value) return 0;
@@ -538,12 +617,12 @@ export class CreateMomentModal extends Modal {
 				"---",
 			].join("\n");
 
-		const body = this.contentValue.trimEnd();
-		const imagesBlock = imageLinks.join("\n");
-		const contentSection = `## 正文\n${body || "（无正文）"}`;
-		const imageSection = `## 图片\n${imagesBlock || "（无图片）"}`;
-		const commentsSection = "## 评论区";
-		const markdown = `${frontmatter}\n\n${contentSection}\n\n${imageSection}\n\n${commentsSection}\n`;
+			const body = this.contentValue.trimEnd();
+			const imagesBlock = imageLinks.join("\n");
+			const contentSection = `## 正文\n${body || "（无正文）"}`;
+			const imageSection = `## 图片\n${imagesBlock || "（无图片）"}`;
+			const commentsSection = "## 评论区";
+			const markdown = `${frontmatter}\n\n${contentSection}\n\n${imageSection}\n\n${commentsSection}\n`;
 
 			const mdFileName = `Moments-${mdTime}-${titleForFilename}.md`;
 			const mdFilePath = normalizePath(`${momentsFolder}/${mdFileName}`);
@@ -670,15 +749,15 @@ export class MomentsSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("展示顺序")
 			.setDesc("按创建时间排序：正序或倒序")
-				.addDropdown((dropdown) =>
-					dropdown
-						.addOption("desc", "倒序（最新在前）")
-						.addOption("asc", "正序（最早在前）")
-						.setValue(this.plugin.settings.order)
-						.onChange(async (value) => {
-							this.plugin.settings.order = value === "asc" ? "asc" : "desc";
-							await this.plugin.saveSettings();
-						}),
-				);
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("desc", "倒序（最新在前）")
+					.addOption("asc", "正序（最早在前）")
+					.setValue(this.plugin.settings.order)
+					.onChange(async (value) => {
+						this.plugin.settings.order = value === "asc" ? "asc" : "desc";
+						await this.plugin.saveSettings();
+					}),
+			);
 	}
 }
