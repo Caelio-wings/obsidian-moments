@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.MomentsSettingTab = exports.CreateMomentModal = exports.DEFAULT_SETTINGS = void 0;
 const obsidian_1 = require("obsidian");
 exports.DEFAULT_SETTINGS = {
+    momentsPath: "Moments/记录/",
     sourceFolders: [],
     attachmentsPath: "Moments/Attachments/",
     order: "desc",
@@ -10,12 +11,8 @@ exports.DEFAULT_SETTINGS = {
 class ObsidianMomentsPlugin extends obsidian_1.Plugin {
     async onload() {
         await this.loadSettings();
-        // 迁移旧配置：如果存在旧的 momentsPath 且 sourceFolders 为空，则自动添加
-        const oldMomentsPath = this.settings.momentsPath;
-        if (oldMomentsPath && this.settings.sourceFolders.length === 0) {
-            this.settings.sourceFolders = [oldMomentsPath];
-            await this.saveSettings();
-        }
+        // 确保 momentsPath 在 sourceFolders 中
+        this.ensureMomentsPathInSourceFolders();
         this.addSettingTab(new MomentsSettingTab(this.app, this));
         this.addCommand({
             id: "create-moments",
@@ -30,10 +27,29 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
     }
     onunload() { }
     async loadSettings() {
-        this.settings = Object.assign({}, exports.DEFAULT_SETTINGS, await this.loadData());
+        const loadedData = await this.loadData();
+        this.settings = Object.assign({}, exports.DEFAULT_SETTINGS, loadedData);
+        // 兼容旧数据：如果旧的 momentsPath 存在且 sourceFolders 为空，自动添加
+        const oldMomentsPath = loadedData?.momentsPath;
+        if (oldMomentsPath && this.settings.sourceFolders.length === 0) {
+            this.settings.sourceFolders = [oldMomentsPath];
+        }
+        await this.saveSettings();
     }
     async saveSettings() {
         await this.saveData(this.settings);
+    }
+    // 确保 momentsPath 在 sourceFolders 中（去重）
+    ensureMomentsPathInSourceFolders() {
+        const path = this.cleanFolderPath(this.settings.momentsPath);
+        if (path && !this.settings.sourceFolders.includes(path)) {
+            this.settings.sourceFolders.push(path);
+            this.saveSettings();
+        }
+    }
+    // 当 momentsPath 改变时调用
+    async onMomentsPathChanged() {
+        this.ensureMomentsPathInSourceFolders();
     }
     async renderMomentsFeed(containerEl, currentSourcePath) {
         containerEl.empty();
@@ -60,7 +76,7 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
             });
             allFiles.push(...files);
         }
-        // 去重（同一个文件可能因多个父目录被重复添加，但实际不会，因为每个文件只有一个路径）
+        // 去重
         const uniqueFiles = Array.from(new Map(allFiles.map(f => [f.path, f])).values());
         const items = [];
         for (const file of uniqueFiles) {
@@ -471,12 +487,12 @@ class CreateMomentModal extends obsidian_1.Modal {
             const imageTime = this.formatImageFileTime(now);
             const titleForFilename = this.sanitizeFileName(this.titleValue || "未命名");
             const attachmentsFolder = this.cleanFolderPath(this.plugin.settings.attachmentsPath);
-            const momentsFolder = this.cleanFolderPath(this.plugin.settings.sourceFolders[0] || "Moments/记录/"); // 默认第一个文件夹
+            const momentsFolder = this.cleanFolderPath(this.plugin.settings.momentsPath);
             if (!attachmentsFolder) {
-                throw new Error("Attachments path is empty");
+                throw new Error("图片附件路径为空，请在设置中配置 attachmentsPath");
             }
             if (!momentsFolder) {
-                throw new Error("Moments source folder is empty, please add at least one source folder in settings");
+                throw new Error("默认发布路径为空，请在设置中配置 momentsPath");
             }
             await this.ensureFolderExists(attachmentsFolder);
             await this.ensureFolderExists(momentsFolder);
@@ -489,7 +505,6 @@ class CreateMomentModal extends obsidian_1.Modal {
                 await this.app.vault.createBinary(imagePath, buffer);
                 imageLinks.push(`![[${imagePath}]]`);
             }
-            // tags 字段添加 "moments"
             const frontmatter = [
                 "---",
                 `标题: ${this.titleValue || ""}`,
@@ -505,7 +520,6 @@ class CreateMomentModal extends obsidian_1.Modal {
             const imageSection = `## 图片\n${imagesBlock || "（无图片）"}`;
             const commentsSection = "## 评论区";
             const markdown = `${frontmatter}\n\n${contentSection}\n\n${imageSection}\n\n${commentsSection}\n`;
-            // 文件名格式：YYYY-MM-DD 标题.md
             const dateStr = this.formatFileDate(now);
             const mdFileName = `${dateStr} ${titleForFilename}.md`;
             const mdFilePath = (0, obsidian_1.normalizePath)(`${momentsFolder}/${mdFileName}`);
@@ -534,7 +548,7 @@ class CreateMomentModal extends obsidian_1.Modal {
         }
         const folder = this.app.vault.getAbstractFileByPath(folderPath);
         if (folder && !(folder instanceof obsidian_1.TFolder)) {
-            throw new Error(`Path is not a folder: ${folderPath}`);
+            throw new Error(`路径不是文件夹: ${folderPath}`);
         }
     }
     sanitizeFileName(value) {
@@ -587,21 +601,35 @@ class MomentsSettingTab extends obsidian_1.PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
         containerEl.createEl("h2", { text: "obsidian-moments 设置" });
-        // 多目录配置
+        // 默认发布路径
+        new obsidian_1.Setting(containerEl)
+            .setName("默认发布路径")
+            .setDesc("新创建的 Moments 文件将保存在此目录（自动加入来源文件夹）")
+            .addText((text) => text
+            .setPlaceholder("例如：Moments/记录/")
+            .setValue(this.plugin.settings.momentsPath)
+            .onChange(async (value) => {
+            const newPath = value.trim() || exports.DEFAULT_SETTINGS.momentsPath;
+            this.plugin.settings.momentsPath = newPath;
+            await this.plugin.saveSettings();
+            // 自动将 momentsPath 同步到 sourceFolders
+            await this.plugin.onMomentsPathChanged();
+            this.display(); // 刷新界面
+        }));
+        // 瀑布流来源文件夹（多目录）
         new obsidian_1.Setting(containerEl)
             .setName("Moments 来源文件夹")
-            .setDesc("Markdown 文件存放的文件夹，只有 frontmatter 中包含 tags: moments 的文件才会被展示")
+            .setDesc("从这里读取带有 tags: moments 的 Markdown 文件展示在瀑布流中（默认发布路径已自动包含）")
             .addButton(btn => btn.setButtonText("添加文件夹").onClick(async () => {
-            // 弹出输入框让用户输入路径
             const inputContainer = containerEl.createDiv({ cls: "moments-add-folder-input" });
-            const input = inputContainer.createEl("input", { type: "text", placeholder: "例如: Moments/记录/" });
+            const input = inputContainer.createEl("input", { type: "text", placeholder: "例如: Moments/旧记录/" });
             const confirmBtn = inputContainer.createEl("button", { text: "确认" });
             confirmBtn.onclick = async () => {
                 const folder = input.value.trim();
                 if (folder && !this.plugin.settings.sourceFolders.includes(folder)) {
                     this.plugin.settings.sourceFolders.push(folder);
                     await this.plugin.saveSettings();
-                    this.display(); // 刷新界面
+                    this.display();
                 }
                 else if (folder) {
                     new obsidian_1.Notice("文件夹已存在");
@@ -619,11 +647,16 @@ class MomentsSettingTab extends obsidian_1.PluginSettingTab {
             };
             setTimeout(() => window.addEventListener("click", outsideClick), 0);
         }));
-        // 显示已有文件夹列表
+        // 显示已有文件夹列表（包括自动加入的 momentsPath）
         for (const folder of this.plugin.settings.sourceFolders) {
             const setting = new obsidian_1.Setting(containerEl)
                 .setName(folder)
                 .addButton(btn => btn.setButtonText("删除").setWarning().onClick(async () => {
+                // 不允许删除默认发布路径
+                if (folder === this.plugin.cleanFolderPath(this.plugin.settings.momentsPath)) {
+                    new obsidian_1.Notice("不能删除默认发布路径，如需移除请先修改默认发布路径");
+                    return;
+                }
                 const idx = this.plugin.settings.sourceFolders.indexOf(folder);
                 if (idx !== -1) {
                     this.plugin.settings.sourceFolders.splice(idx, 1);
@@ -631,7 +664,12 @@ class MomentsSettingTab extends obsidian_1.PluginSettingTab {
                     this.display();
                 }
             }));
-            setting.descEl.createSpan({ text: "📁 来源目录", cls: "moments-folder-desc" });
+            if (folder === this.plugin.cleanFolderPath(this.plugin.settings.momentsPath)) {
+                setting.descEl.createSpan({ text: "⭐ 默认发布路径（自动包含）", cls: "moments-folder-desc" });
+            }
+            else {
+                setting.descEl.createSpan({ text: "📁 额外来源", cls: "moments-folder-desc" });
+            }
         }
         new obsidian_1.Setting(containerEl)
             .setName("图片附件存储路径")
