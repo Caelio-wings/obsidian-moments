@@ -3,13 +3,19 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.MomentsSettingTab = exports.CreateMomentModal = exports.DEFAULT_SETTINGS = void 0;
 const obsidian_1 = require("obsidian");
 exports.DEFAULT_SETTINGS = {
-    momentsPath: "Moments/记录/",
+    sourceFolders: [],
     attachmentsPath: "Moments/Attachments/",
     order: "desc",
 };
 class ObsidianMomentsPlugin extends obsidian_1.Plugin {
     async onload() {
         await this.loadSettings();
+        // 迁移旧配置：如果存在旧的 momentsPath 且 sourceFolders 为空，则自动添加
+        const oldMomentsPath = this.settings.momentsPath;
+        if (oldMomentsPath && this.settings.sourceFolders.length === 0) {
+            this.settings.sourceFolders = [oldMomentsPath];
+            await this.saveSettings();
+        }
         this.addSettingTab(new MomentsSettingTab(this.app, this));
         this.addCommand({
             id: "create-moments",
@@ -22,9 +28,7 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
             await this.renderMomentsFeed(el, ctx.sourcePath);
         });
     }
-    onunload() {
-        // 预留：后续如果注册视图、事件或命令，在此处释放。
-    }
+    onunload() { }
     async loadSettings() {
         this.settings = Object.assign({}, exports.DEFAULT_SETTINGS, await this.loadData());
     }
@@ -34,18 +38,32 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
     async renderMomentsFeed(containerEl, currentSourcePath) {
         containerEl.empty();
         const feedEl = containerEl.createDiv({ cls: "moments-feed" });
-        const folderPath = this.cleanFolderPath(this.settings.momentsPath);
-        if (!folderPath) {
-            feedEl.createDiv({ text: "请先在插件设置中配置 Moments 存储路径。" });
+        if (!this.settings.sourceFolders.length) {
+            feedEl.createDiv({ text: "请先在插件设置中添加至少一个 Moments 来源文件夹。" });
             return;
         }
-        const files = this.getMomentMarkdownFiles(folderPath, currentSourcePath);
-        if (files.length === 0) {
-            feedEl.createDiv({ text: "暂无 Moments 记录。" });
-            return;
+        // 收集所有来源文件夹中的文件
+        const allFiles = [];
+        for (const rawFolder of this.settings.sourceFolders) {
+            const folderPath = this.cleanFolderPath(rawFolder);
+            if (!folderPath)
+                continue;
+            const prefix = `${folderPath}/`;
+            const files = this.app.vault.getFiles().filter((file) => {
+                if (file.extension !== "md")
+                    return false;
+                if (!file.path.startsWith(prefix))
+                    return false;
+                if (currentSourcePath && file.path === currentSourcePath)
+                    return false;
+                return true;
+            });
+            allFiles.push(...files);
         }
+        // 去重（同一个文件可能因多个父目录被重复添加，但实际不会，因为每个文件只有一个路径）
+        const uniqueFiles = Array.from(new Map(allFiles.map(f => [f.path, f])).values());
         const items = [];
-        for (const file of files) {
+        for (const file of uniqueFiles) {
             const item = await this.readMomentItem(file);
             if (item)
                 items.push(item);
@@ -55,35 +73,30 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
             const timeB = this.parseDateTime(b.createdAt);
             return this.settings.order === "asc" ? timeA - timeB : timeB - timeA;
         });
-        // 异步渲染每个卡片，等待所有完成
         const renderPromises = items.map(item => this.renderMomentCardAsync(feedEl, item));
         await Promise.all(renderPromises);
-    }
-    getMomentMarkdownFiles(folderPath, currentSourcePath) {
-        const prefix = `${folderPath}/`;
-        return this.app.vault.getFiles().filter((file) => {
-            if (file.extension !== "md")
-                return false;
-            if (!file.path.startsWith(prefix))
-                return false;
-            if (currentSourcePath && file.path === currentSourcePath)
-                return false;
-            return file.name.startsWith("Moments-");
-        });
     }
     async readMomentItem(file) {
         const cache = this.app.metadataCache.getFileCache(file);
         const frontmatter = cache?.frontmatter ?? {};
-        if (!file.name.startsWith("Moments-")) {
-            return null;
+        // 检查 tags 是否包含 "moments"
+        let hasMomentsTag = false;
+        const tags = frontmatter["tags"];
+        if (Array.isArray(tags)) {
+            hasMomentsTag = tags.includes("moments");
         }
+        else if (typeof tags === "string") {
+            hasMomentsTag = tags === "moments" || tags.split(/\s*,\s*/).includes("moments");
+        }
+        if (!hasMomentsTag)
+            return null;
         const title = typeof frontmatter["标题"] === "string" ? frontmatter["标题"] : file.basename;
         const location = typeof frontmatter["地点"] === "string" ? frontmatter["地点"] : "";
-        const createdAt = typeof frontmatter["创建时间"] === "string" ? frontmatter["创建时间"] : "";
+        const createdAt = typeof frontmatter["created"] === "string" ? frontmatter["created"] : "";
         const raw = await this.app.vault.read(file);
         const markdownBody = this.stripYamlFrontmatter(raw).trim();
         const body = this.extractContentSection(markdownBody);
-        const imagesMarkdown = this.extractImagesSection(markdownBody); // 新增
+        const imagesMarkdown = this.extractImagesSection(markdownBody);
         const images = this.extractImageLinks(markdownBody);
         const comments = this.extractCommentsFromMarkdown(markdownBody);
         return { file, title, location, createdAt, comments, body, images, imagesMarkdown };
@@ -96,7 +109,6 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
         const scope = imageSection ?? content;
         const result = [];
         this.forEachNonCodeSegment(scope, (segment) => {
-            // 提取 Obsidian 格式
             const obsidianRegex = /!\[\[([^\]]+?)\]\]/g;
             let obsidianMatch = null;
             while ((obsidianMatch = obsidianRegex.exec(segment)) !== null) {
@@ -104,7 +116,6 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
                 if (raw)
                     result.push(raw);
             }
-            // 提取 Markdown 格式
             const markdownRegex = /!\[[^\]]*\]\(([^)\s]+)\)/g;
             let markdownMatch = null;
             while ((markdownMatch = markdownRegex.exec(segment)) !== null) {
@@ -115,7 +126,6 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
         });
         return result;
     }
-    // 新增：提取图片节的原始 Markdown 文本
     extractImagesSection(content) {
         const normalized = content.replace(/\r\n/g, "\n");
         const lines = normalized.split("\n");
@@ -215,18 +225,15 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
         }
         flush();
     }
-    // 修改为异步方法，并使用 MarkdownRenderer 渲染图片
     async renderMomentCardAsync(parentEl, item) {
         const cardEl = parentEl.createDiv({ cls: "moments-card" });
         const headerEl = cardEl.createDiv({ cls: "moments-card-header" });
         headerEl.createDiv({ cls: "moments-title", text: item.title || "未命名" });
         const bodyEl = cardEl.createDiv({ cls: "moments-body" });
         bodyEl.setText(this.removeImageLinksFromBody(item.body));
-        // 图片部分：使用 MarkdownRenderer 渲染，然后重新组织为网格布局
         if (item.imagesMarkdown && item.imagesMarkdown.trim()) {
             const tempDiv = document.createElement("div");
             await obsidian_1.MarkdownRenderer.render(this.app, item.imagesMarkdown, tempDiv, item.file.path, this);
-            // 提取所有图片元素
             const images = Array.from(tempDiv.querySelectorAll("img"));
             if (images.length > 0) {
                 const gridEl = cardEl.createDiv({ cls: "moments-grid" });
@@ -240,7 +247,6 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
                     gridEl.addClass("moments-grid--3");
                 this.applyGridLayoutStyle(gridEl, imgCount);
                 for (const img of images) {
-                    // 移除原有样式，让网格控制
                     img.style.width = "100%";
                     img.style.display = "block";
                     img.style.objectFit = imgCount === 1 ? "contain" : "cover";
@@ -323,34 +329,6 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
             }
         });
     }
-    // 新增：对渲染后的图片应用网格样式
-    applyGridToRenderedImages(container, imgCount) {
-        const imgs = container.querySelectorAll("img");
-        if (imgs.length === 0)
-            return;
-        container.classList.add("moments-images-render-grid");
-        container.style.display = "grid";
-        container.style.gap = "5px";
-        if (imgCount === 1) {
-            container.style.gridTemplateColumns = "1fr";
-            container.style.maxWidth = "220px";
-        }
-        else if (imgCount <= 4) {
-            container.style.gridTemplateColumns = "repeat(2, minmax(0, 1fr))";
-            container.style.maxWidth = "220px";
-        }
-        else {
-            container.style.gridTemplateColumns = "repeat(3, minmax(0, 1fr))";
-            container.style.maxWidth = "330px";
-        }
-        imgs.forEach(img => {
-            img.style.width = "100%";
-            img.style.display = "block";
-            img.style.objectFit = imgCount === 1 ? "contain" : "cover";
-            img.style.aspectRatio = imgCount === 1 ? "auto" : "1 / 1";
-            img.style.borderRadius = "4px";
-        });
-    }
     renderCommentsList(containerEl, comments) {
         containerEl.empty();
         if (comments.length === 0) {
@@ -387,17 +365,6 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
         });
         return parts.join("\n").trim();
     }
-    resolveImageResourcePath(link, fromFile) {
-        // 判断是否是网络URL（以 http://, https://, // 开头）
-        if (link.match(/^(https?:\/\/|\/\/)/)) {
-            return link;
-        }
-        // 处理本地文件
-        const target = this.app.metadataCache.getFirstLinkpathDest(link, fromFile.path);
-        if (!target)
-            return null;
-        return this.app.vault.adapter.getResourcePath(target.path);
-    }
     applyGridLayoutStyle(gridEl, imgCount) {
         gridEl.style.display = "grid";
         gridEl.style.gap = "5px";
@@ -417,7 +384,7 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
     parseDateTime(value) {
         if (!value)
             return 0;
-        const parsed = Date.parse(value.replace(" ", "T"));
+        const parsed = Date.parse(value);
         return Number.isNaN(parsed) ? 0 : parsed;
     }
     formatCommentTime(date) {
@@ -427,15 +394,6 @@ class ObsidianMomentsPlugin extends obsidian_1.Plugin {
         const hh = this.pad(date.getHours());
         const mi = this.pad(date.getMinutes());
         return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
-    }
-    formatDateTime(date) {
-        const yyyy = date.getFullYear();
-        const mm = this.pad(date.getMonth() + 1);
-        const dd = this.pad(date.getDate());
-        const hh = this.pad(date.getHours());
-        const mi = this.pad(date.getMinutes());
-        const ss = this.pad(date.getSeconds());
-        return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
     }
     pad(value) {
         return value.toString().padStart(2, "0");
@@ -509,17 +467,16 @@ class CreateMomentModal extends obsidian_1.Modal {
     async handleSubmit() {
         try {
             const now = new Date();
-            const createdAt = this.formatDateTime(now);
-            const mdTime = this.formatMarkdownFileTime(now);
+            const createdAt = this.formatDateTimeISO(now);
             const imageTime = this.formatImageFileTime(now);
             const titleForFilename = this.sanitizeFileName(this.titleValue || "未命名");
             const attachmentsFolder = this.cleanFolderPath(this.plugin.settings.attachmentsPath);
-            const momentsFolder = this.cleanFolderPath(this.plugin.settings.momentsPath);
+            const momentsFolder = this.cleanFolderPath(this.plugin.settings.sourceFolders[0] || "Moments/记录/"); // 默认第一个文件夹
             if (!attachmentsFolder) {
                 throw new Error("Attachments path is empty");
             }
             if (!momentsFolder) {
-                throw new Error("Moments path is empty");
+                throw new Error("Moments source folder is empty, please add at least one source folder in settings");
             }
             await this.ensureFolderExists(attachmentsFolder);
             await this.ensureFolderExists(momentsFolder);
@@ -532,12 +489,14 @@ class CreateMomentModal extends obsidian_1.Modal {
                 await this.app.vault.createBinary(imagePath, buffer);
                 imageLinks.push(`![[${imagePath}]]`);
             }
+            // tags 字段添加 "moments"
             const frontmatter = [
                 "---",
                 `标题: ${this.titleValue || ""}`,
                 `地点: ${this.locationValue || ""}`,
-                `创建时间: ${createdAt}`,
-                `更新时间: ${createdAt}`,
+                `created: ${createdAt}`,
+                `updated: ${createdAt}`,
+                `tags: [moments]`,
                 "---",
             ].join("\n");
             const body = this.contentValue.trimEnd();
@@ -546,7 +505,9 @@ class CreateMomentModal extends obsidian_1.Modal {
             const imageSection = `## 图片\n${imagesBlock || "（无图片）"}`;
             const commentsSection = "## 评论区";
             const markdown = `${frontmatter}\n\n${contentSection}\n\n${imageSection}\n\n${commentsSection}\n`;
-            const mdFileName = `Moments-${mdTime}-${titleForFilename}.md`;
+            // 文件名格式：YYYY-MM-DD 标题.md
+            const dateStr = this.formatFileDate(now);
+            const mdFileName = `${dateStr} ${titleForFilename}.md`;
             const mdFilePath = (0, obsidian_1.normalizePath)(`${momentsFolder}/${mdFileName}`);
             await this.app.vault.create(mdFilePath, markdown);
             new obsidian_1.Notice("Moments 发布成功");
@@ -591,23 +552,20 @@ class CreateMomentModal extends obsidian_1.Modal {
     pad(value) {
         return value.toString().padStart(2, "0");
     }
-    formatDateTime(date) {
+    formatDateTimeISO(date) {
         const yyyy = date.getFullYear();
         const mm = this.pad(date.getMonth() + 1);
         const dd = this.pad(date.getDate());
         const hh = this.pad(date.getHours());
         const mi = this.pad(date.getMinutes());
         const ss = this.pad(date.getSeconds());
-        return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+        return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}`;
     }
-    formatMarkdownFileTime(date) {
+    formatFileDate(date) {
         const yyyy = date.getFullYear();
         const mm = this.pad(date.getMonth() + 1);
         const dd = this.pad(date.getDate());
-        const hh = this.pad(date.getHours());
-        const mi = this.pad(date.getMinutes());
-        const ss = this.pad(date.getSeconds());
-        return `${yyyy}-${mm}-${dd}-${hh}${mi}${ss}`;
+        return `${yyyy}-${mm}-${dd}`;
     }
     formatImageFileTime(date) {
         const yyyy = date.getFullYear();
@@ -629,16 +587,52 @@ class MomentsSettingTab extends obsidian_1.PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
         containerEl.createEl("h2", { text: "obsidian-moments 设置" });
+        // 多目录配置
         new obsidian_1.Setting(containerEl)
-            .setName("Moments 存储路径")
-            .setDesc("用于保存每条 Moments 记录的 .md 文件目录")
-            .addText((text) => text
-            .setPlaceholder("例如：Moments/记录/")
-            .setValue(this.plugin.settings.momentsPath)
-            .onChange(async (value) => {
-            this.plugin.settings.momentsPath = value.trim() || exports.DEFAULT_SETTINGS.momentsPath;
-            await this.plugin.saveSettings();
+            .setName("Moments 来源文件夹")
+            .setDesc("Markdown 文件存放的文件夹，只有 frontmatter 中包含 tags: moments 的文件才会被展示")
+            .addButton(btn => btn.setButtonText("添加文件夹").onClick(async () => {
+            // 弹出输入框让用户输入路径
+            const inputContainer = containerEl.createDiv({ cls: "moments-add-folder-input" });
+            const input = inputContainer.createEl("input", { type: "text", placeholder: "例如: Moments/记录/" });
+            const confirmBtn = inputContainer.createEl("button", { text: "确认" });
+            confirmBtn.onclick = async () => {
+                const folder = input.value.trim();
+                if (folder && !this.plugin.settings.sourceFolders.includes(folder)) {
+                    this.plugin.settings.sourceFolders.push(folder);
+                    await this.plugin.saveSettings();
+                    this.display(); // 刷新界面
+                }
+                else if (folder) {
+                    new obsidian_1.Notice("文件夹已存在");
+                }
+            };
+            input.focus();
+            const onBlur = () => {
+                inputContainer.remove();
+                window.removeEventListener("click", outsideClick);
+            };
+            const outsideClick = (e) => {
+                if (!inputContainer.contains(e.target)) {
+                    onBlur();
+                }
+            };
+            setTimeout(() => window.addEventListener("click", outsideClick), 0);
         }));
+        // 显示已有文件夹列表
+        for (const folder of this.plugin.settings.sourceFolders) {
+            const setting = new obsidian_1.Setting(containerEl)
+                .setName(folder)
+                .addButton(btn => btn.setButtonText("删除").setWarning().onClick(async () => {
+                const idx = this.plugin.settings.sourceFolders.indexOf(folder);
+                if (idx !== -1) {
+                    this.plugin.settings.sourceFolders.splice(idx, 1);
+                    await this.plugin.saveSettings();
+                    this.display();
+                }
+            }));
+            setting.descEl.createSpan({ text: "📁 来源目录", cls: "moments-folder-desc" });
+        }
         new obsidian_1.Setting(containerEl)
             .setName("图片附件存储路径")
             .setDesc("用于保存通过插件上传的图片文件")
